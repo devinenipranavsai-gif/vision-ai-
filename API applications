@@ -1,0 +1,85 @@
+Execute as the application role inside a transaction after setting the verified request context.
+SET search_path TO medibridge, public;
+
+-- 1. Find verified doctors by specialty and approximate location (portable latitude/longitude bounding box).
+SELECT d.id, d.first_name, d.last_name, d.qualification, d.consultation_fee, h.name AS hospital_name,
+       a.city, a.latitude, a.longitude
+FROM doctors d
+JOIN doctor_specialties ds ON ds.doctor_id=d.id
+JOIN specialties s ON s.id=ds.specialty_id
+LEFT JOIN hospitals h ON h.id=d.hospital_id
+LEFT JOIN addresses a ON a.id=h.address_id
+WHERE s.name = :specialty_name AND d.verification_status='VERIFIED' AND d.deleted_at IS NULL
+  AND a.latitude BETWEEN :latitude - :latitude_delta AND :latitude + :latitude_delta
+  AND a.longitude BETWEEN :longitude - :longitude_delta AND :longitude + :longitude_delta
+ORDER BY d.experience_years DESC, d.last_name;
+
+-- 2. Find nearby verified hospitals. For production radius search, replace the bounding box with PostGIS ST_DWithin.
+SELECT h.id, h.name, h.hospital_type, h.emergency_service_status, a.city, a.latitude, a.longitude
+FROM hospitals h JOIN addresses a ON a.id=h.address_id
+WHERE h.verification_status='VERIFIED' AND h.deleted_at IS NULL
+  AND a.latitude BETWEEN :latitude - :latitude_delta AND :latitude + :latitude_delta
+  AND a.longitude BETWEEN :longitude - :longitude_delta AND :longitude + :longitude_delta
+ORDER BY h.name;
+
+-- 3. Create an appointment. The GiST exclusion constraint gives the final concurrency guarantee.
+BEGIN;
+INSERT INTO appointments(patient_id,doctor_id,hospital_id,appointment_date,start_time,end_time,reason,status,booking_source)
+VALUES (:patient_id,:doctor_id,:hospital_id,:date,:start_time,:end_time,:reason,'SCHEDULED','PATIENT_APP')
+RETURNING id;
+-- Use returned id as :appointment_id.
+INSERT INTO appointment_events(appointment_id,event_type,performed_by,metadata)
+VALUES (:appointment_id,'BOOKED',app_current_user_id(),jsonb_build_object('source','PATIENT_APP'));
+COMMIT;
+
+-- 4. Check appointment conflict before showing a slot (the insert above is still required).
+SELECT EXISTS (
+  SELECT 1 FROM appointments
+  WHERE doctor_id=:doctor_id AND appointment_date=:date
+    AND status IN ('SCHEDULED','CONFIRMED','CHECKED_IN','IN_PROGRESS')
+    AND tsrange(appointment_date + start_time, appointment_date + end_time, '[)')
+        && tsrange(:date::date + :start_time::time, :date::date + :end_time::time, '[)')
+) AS conflicts;
+
+-- 5. Get a patient's authorized medical records (RLS additionally filters rows).
+SELECT id,record_type,title,record_date,document_url
+FROM medical_records WHERE patient_id=:patient_id AND deleted_at IS NULL
+ORDER BY record_date DESC, created_at DESC;
+
+-- 6. Verify consent before a non-patient provider reads a record.
+SELECT app_has_care_relationship(:patient_id) AS relationship_ok,
+       app_has_active_consent(:patient_id,:scope::consent_scope) AS consent_ok;
+-- If both are true, call SELECT log_record_access(:patient_id,:record_id,'VIEW',:purpose,:ip,:device)
+-- immediately before issuing an authorized signed document URL.
+
+-- 7. Find participating ambulances with a confirmed, integration-backed status.
+SELECT id,operator_name,registration_number,vehicle_type,current_latitude,current_longitude,updated_at
+FROM ambulances
+WHERE verification_status='VERIFIED' AND availability_status='CONFIRMED'
+ORDER BY updated_at DESC;
+
+-- 8. Latest ambulance GPS point.
+SELECT DISTINCT ON (ambulance_id) ambulance_id, latitude, longitude, speed, heading, accuracy, recorded_at
+FROM gps_locations WHERE ambulance_id=:ambulance_id ORDER BY ambulance_id, recorded_at DESC;
+
+-- 9. Emergency request status and most recent dispatch attempt.
+SELECT er.id, er.status, er.priority, er.created_at, ar.status AS ambulance_status, ar.ambulance_id, ar.assigned_at
+FROM emergency_requests er LEFT JOIN LATERAL (
+  SELECT * FROM ambulance_requests WHERE emergency_request_id=er.id ORDER BY assigned_at DESC LIMIT 1
+) ar ON true WHERE er.id=:emergency_request_id;
+
+-- 10. Pharmacy medicine availability; UNKNOWN is not stock confirmation.
+SELECT p.name AS pharmacy, m.name, m.strength, pi.price, pi.quantity, pi.availability_status, pi.updated_at
+FROM pharmacy_inventory pi JOIN pharmacies p ON p.id=pi.pharmacy_id JOIN medicines m ON m.id=pi.medicine_id
+WHERE m.id=:medicine_id ORDER BY pi.updated_at DESC;
+
+-- 11. Laboratory test prices with qualification.
+SELECT l.name AS laboratory, t.name AS test, lt.price, lt.price_status, lt.home_collection, lt.availability_status
+FROM laboratory_tests lt JOIN laboratories l ON l.id=lt.laboratory_id JOIN lab_tests t ON t.id=lt.test_id
+WHERE t.id=:test_id ORDER BY lt.price NULLS LAST;
+
+-- 12. Patient appointment history.
+SELECT ap.id, ap.appointment_date, ap.start_time, ap.end_time, ap.status, d.first_name, d.last_name, h.name AS hospital
+FROM appointments ap JOIN doctors d ON d.id=ap.doctor_id LEFT JOIN hospitals h ON h.id=ap.hospital_id
+WHERE ap.patient_id=:patient_id ORDER BY ap.appointment_date DESC, ap.start_time DESC;
+
