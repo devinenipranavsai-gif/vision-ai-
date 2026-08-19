@@ -1,0 +1,128 @@
+"""
+kpi_engine.py
+-------------
+Computes standard poultry-industry KPIs from a daily farm log DataFrame,
+using vectorized NumPy / Pandas operations (no per-row Python loops).
+
+Expected input columns (see data_simulator.py for schema):
+    date, day_of_batch, bird_population, mortality, feed_consumed_kg,
+    water_consumed_l, avg_body_weight_g, temperature_c, humidity_pct,
+    production_units
+"""
+
+from __future__ import annotations
+import numpy as np
+import pandas as pd
+
+
+REQUIRED_COLUMNS = [
+    "date", "day_of_batch", "bird_population", "mortality",
+    "feed_consumed_kg", "water_consumed_l", "avg_body_weight_g",
+    "temperature_c", "humidity_pct", "production_units",
+]
+
+
+def validate_schema(df: pd.DataFrame) -> None:
+    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+    if missing:
+        raise ValueError(f"Input data is missing required columns: {missing}")
+
+
+def compute_daily_kpis(df: pd.DataFrame, starting_population: int | None = None) -> pd.DataFrame:
+    """
+    Adds a set of daily and cumulative KPI columns to a copy of the input
+    DataFrame. Does not mutate the original.
+
+    KPIs added:
+      daily_mortality_rate_pct   : mortality / population that day, %
+      cumulative_mortality_pct   : total dead so far / starting population, %
+      livability_pct             : 100 - cumulative_mortality_pct
+      daily_weight_gain_g        : change in avg body weight vs prior day
+      cum_feed_per_bird_kg       : running total feed / current population
+      fcr                        : Feed Conversion Ratio = cum feed (kg) / cum
+                                    weight gain (kg) per surviving bird
+      water_feed_ratio           : water consumed / feed consumed (by weight)
+      adg_g                      : Average Daily Gain (g/bird/day), same as
+                                    daily_weight_gain_g, industry-standard name
+      production_efficiency_factor (PEF) : industry broiler index =
+                                    (livability% * avg_body_weight_kg) /
+                                    (age_days * FCR) * 100
+    """
+    validate_schema(df)
+    out = df.sort_values("day_of_batch").reset_index(drop=True).copy()
+
+    if starting_population is None:
+        starting_population = int(out.loc[0, "bird_population"])
+
+    # --- mortality metrics ---
+    out["daily_mortality_rate_pct"] = (
+        out["mortality"] / out["bird_population"].replace(0, np.nan) * 100
+    ).fillna(0)
+
+    out["cumulative_dead"] = out["mortality"].cumsum()
+    out["cumulative_mortality_pct"] = out["cumulative_dead"] / starting_population * 100
+    out["livability_pct"] = 100 - out["cumulative_mortality_pct"]
+
+    # --- growth metrics ---
+    out["daily_weight_gain_g"] = out["avg_body_weight_g"].diff().fillna(
+        out["avg_body_weight_g"].iloc[0]
+    )
+    out["adg_g"] = out["daily_weight_gain_g"]  # alias, industry-standard name
+
+    # --- feed / water metrics ---
+    out["cum_feed_kg"] = out["feed_consumed_kg"].cumsum()
+    out["cum_water_l"] = out["water_consumed_l"].cumsum()
+    out["cum_feed_per_bird_kg"] = out["cum_feed_kg"] / out["bird_population"].replace(0, np.nan)
+    out["water_feed_ratio"] = (
+        out["water_consumed_l"] / out["feed_consumed_kg"].replace(0, np.nan)
+    ).fillna(0)
+
+    # FCR: cumulative feed (kg) per bird / cumulative weight gained (kg) per bird
+    cum_gain_kg_per_bird = (out["avg_body_weight_g"] - out["avg_body_weight_g"].iloc[0]) / 1000.0
+    out["fcr"] = out["cum_feed_per_bird_kg"] / cum_gain_kg_per_bird.replace(0, np.nan)
+    out["fcr"] = out["fcr"].replace([np.inf, -np.inf], np.nan)
+
+    # Production Efficiency Factor (PEF) - standard broiler industry formula
+    weight_kg = out["avg_body_weight_g"] / 1000.0
+    out["production_efficiency_factor"] = (
+        (out["livability_pct"] * weight_kg) / (out["day_of_batch"] * out["fcr"]) * 100
+    ).replace([np.inf, -np.inf], np.nan)
+
+    return out
+
+
+def summarize_batch(kpi_df: pd.DataFrame) -> dict:
+    """
+    Produces a single dict of headline batch-level KPIs from the most recent
+    day of a KPI-enriched DataFrame (as returned by compute_daily_kpis).
+    Useful for dashboards, reports, or feeding to the GenAI advisor.
+    """
+    latest = kpi_df.iloc[-1]
+    return {
+        "batch_age_days": int(latest["day_of_batch"]),
+        "current_population": int(latest["bird_population"]),
+        "cumulative_mortality_pct": round(float(latest["cumulative_mortality_pct"]), 2),
+        "livability_pct": round(float(latest["livability_pct"]), 2),
+        "avg_body_weight_g": round(float(latest["avg_body_weight_g"]), 1),
+        "fcr": round(float(latest["fcr"]), 3) if pd.notna(latest["fcr"]) else None,
+        "production_efficiency_factor": (
+            round(float(latest["production_efficiency_factor"]), 1)
+            if pd.notna(latest["production_efficiency_factor"]) else None
+        ),
+        "water_feed_ratio": round(float(latest["water_feed_ratio"]), 2),
+        "total_feed_consumed_kg": round(float(latest["cum_feed_kg"]), 1),
+        "total_water_consumed_l": round(float(latest["cum_water_l"]), 1),
+    }
+
+
+if __name__ == "__main__":
+    from data_simulator import simulate_farm_data
+    raw = simulate_farm_data()
+    kpis = compute_daily_kpis(raw)
+    print(kpis[[
+        "day_of_batch", "bird_population", "daily_mortality_rate_pct",
+        "livability_pct", "fcr", "production_efficiency_factor"
+    ]].tail(10).to_string(index=False))
+    print("\nBatch summary:")
+    for k, v in summarize_batch(kpis).items():
+        print(f"  {k}: {v}")
