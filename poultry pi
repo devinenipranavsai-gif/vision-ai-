@@ -1,0 +1,245 @@
+"""
+genai_advisor.py
+------------------
+Uses a Generative AI model (Anthropic Claude by default) to translate the
+raw KPI numbers, detected anomalies, and predicted problems into a simple,
+farmer-friendly explanation with actionable recommendations.
+
+Design notes:
+- If no API key is available (ANTHROPIC_API_KEY env var not set), this
+  module falls back to a rule-based local explainer so the pipeline still
+  runs end-to-end offline / in demos / in CI.
+- The prompt asks the model to return structured JSON so the output can be
+  rendered in a dashboard, not just printed as free text.
+- Swap `_call_claude` for any other provider's SDK (OpenAI, etc.) if needed
+  — everything else in this module is provider-agnostic.
+"""
+
+from __future__ import annotations
+import json
+import os
+from typing import Any
+
+
+SYSTEM_PROMPT = """You are an agricultural extension advisor speaking directly to a \
+poultry farmer who has no technical or data-science background. You will be given \
+KPI numbers, statistically detected anomalies, and short-term forecasts from a farm \
+analytics system. Your job:
+
+1. Explain what is happening in plain, simple language (avoid jargon; where a \
+   technical term is unavoidable, briefly explain it in parentheses).
+2. Explain WHY it matters for the flock and the farmer's bottom line.
+3. Give clear, prioritized, actionable recommendations the farmer can act on today.
+4. Be calm and factual — do not exaggerate risk, but do not understate genuine \
+   red flags either.
+
+Respond ONLY with valid JSON (no markdown fences, no preamble) matching this schema:
+{
+  "overall_status": "healthy" | "watch" | "needs_attention" | "urgent",
+  "summary": "<2-3 sentence plain-language summary of the flock's condition>",
+  "issues": [
+    {
+      "title": "<short plain-language title>",
+      "explanation": "<what's happening and why it matters, 2-4 sentences>",
+      "urgency": "low" | "medium" | "high",
+      "recommendations": ["<action 1>", "<action 2>", "..."]
+    }
+  ],
+  "positive_notes": ["<any genuinely good signals worth acknowledging, if any>"]
+}
+"""
+
+
+def _build_user_prompt(kpi_summary: dict, anomalies: list[dict], predictions: list[dict]) -> str:
+    payload = {
+        "current_farm_kpis": kpi_summary,
+        "detected_anomalies_recent": anomalies[-15:],  # cap payload size
+        "predicted_near_term_problems": predictions,
+    }
+    return (
+        "Here is the latest data from the farm analytics system:\n\n"
+        f"{json.dumps(payload, indent=2, default=str)}\n\n"
+        "Please analyze this and respond with the JSON schema described in your instructions."
+    )
+
+
+def _call_claude(system_prompt: str, user_prompt: str, model: str = "claude-sonnet-4-6") -> str:
+    """Calls the Anthropic API. Requires ANTHROPIC_API_KEY in the environment."""
+    import anthropic  # imported lazily so the module still loads without the package
+
+    client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from env automatically
+    response = client.messages.create(
+        model=model,
+        max_tokens=1500,
+        system=system_prompt,
+        messages=[{"role": "user", "content": user_prompt}],
+    )
+    text_parts = [block.text for block in response.content if block.type == "text"]
+    return "\n".join(text_parts)
+
+
+def _local_fallback_explainer(kpi_summary: dict, anomalies: list[dict],
+                               predictions: list[dict]) -> dict:
+    """
+    A deterministic, rule-based fallback used when no GenAI API key is
+    configured. Ensures the system is still useful offline and makes it
+    obvious in testing/demo environments what the AI layer would receive.
+    """
+    issues = []
+    urgent_count = 0
+
+    high_sev_anomalies = [a for a in anomalies if a.get("severity") == "high"]
+    if high_sev_anomalies:
+        metrics_hit = sorted({a["metric"] for a in high_sev_anomalies})
+        urgent_count += 1
+        issues.append({
+            "title": "Unusual changes detected in the flock",
+            "explanation": (
+                f"The system noticed sudden, unusual changes in: {', '.join(metrics_hit)}. "
+                "These kinds of sudden shifts often point to a health event (like disease "
+                "or heat stress) or an equipment problem (like a blocked feeder or water line)."
+            ),
+            "urgency": "high",
+            "recommendations": [
+                "Walk the house today and visually check bird behavior, feed lines, and water lines.",
+                "Check for any dead or visibly sick birds and isolate if needed.",
+                "Review ventilation and temperature control settings for the affected day(s).",
+            ],
+        })
+
+    critical_preds = [p for p in predictions if p.get("risk_level") == "critical"]
+    if critical_preds:
+        urgent_count += 1
+        for p in critical_preds:
+            issues.append({
+                "title": f"{p['metric'].replace('_', ' ').title()} is trending toward a critical level",
+                "explanation": (
+                    f"Based on the recent trend, {p['metric'].replace('_', ' ')} is projected to "
+                    f"reach {p['forecast_value']} by day {p['forecast_day']} if nothing changes. "
+                    "Catching this early gives you time to act before it becomes a bigger loss."
+                ),
+                "urgency": "high",
+                "recommendations": [
+                    "Investigate the likely cause today rather than waiting for it to worsen.",
+                    "Consult your vet or flock supervisor if this trend continues tomorrow.",
+                ],
+            })
+
+    warn_preds = [p for p in predictions if p.get("risk_level") == "warning"]
+    for p in warn_preds:
+        issues.append({
+            "title": f"{p['metric'].replace('_', ' ').title()} is worth watching",
+            "explanation": p.get("detail", ""),
+            "urgency": "medium",
+            "recommendations": [
+                "Keep monitoring this metric daily.",
+                "No urgent action needed yet, but don't ignore it if the trend continues.",
+            ],
+        })
+
+    if urgent_count >= 2:
+        overall = "urgent"
+    elif issues:
+        overall = "needs_attention" if any(i["urgency"] == "high" for i in issues) else "watch"
+    else:
+        overall = "healthy"
+
+    positive_notes = []
+    if kpi_summary.get("livability_pct", 0) >= 95:
+        positive_notes.append("Livability remains strong at "
+                               f"{kpi_summary.get('livability_pct')}%.")
+    if kpi_summary.get("fcr") and kpi_summary["fcr"] < 1.7:
+        positive_notes.append(f"Feed conversion ratio ({kpi_summary['fcr']}) is efficient.")
+
+    summary = (
+        f"Flock is on day {kpi_summary.get('batch_age_days')} with "
+        f"{kpi_summary.get('current_population')} birds and "
+        f"{kpi_summary.get('livability_pct')}% livability. "
+        + ("Some issues need your attention — see below."
+           if issues else "No major issues detected right now.")
+    )
+
+    return {
+        "overall_status": overall,
+        "summary": summary,
+        "issues": issues,
+        "positive_notes": positive_notes,
+        "_note": "Generated by local rule-based fallback (no GenAI API key configured).",
+    }
+
+
+def generate_farmer_report(kpi_summary: dict, anomalies: list[dict],
+                            predictions: list[dict],
+                            model: str = "claude-sonnet-4-6",
+                            force_fallback: bool = False) -> dict:
+    """
+    Main entry point. Returns a structured, farmer-friendly report dict.
+
+    Parameters
+    ----------
+    kpi_summary : dict from kpi_engine.summarize_batch()
+    anomalies   : list of dicts (e.g. anomaly_detector.detect_anomalies(...).to_dict("records"))
+    predictions : list of dicts from problem_predictor.predict_problems()
+    model       : Claude model name to use
+    force_fallback : if True, skips the API call and uses the local explainer
+                      (useful for testing without API access/cost)
+    """
+    if force_fallback or not os.environ.get("ANTHROPIC_API_KEY"):
+        return _local_fallback_explainer(kpi_summary, anomalies, predictions)
+
+    user_prompt = _build_user_prompt(kpi_summary, anomalies, predictions)
+    try:
+        raw_response = _call_claude(SYSTEM_PROMPT, user_prompt, model=model)
+        cleaned = raw_response.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.strip("`")
+            if cleaned.lower().startswith("json"):
+                cleaned = cleaned[4:]
+        report = json.loads(cleaned)
+        return report
+    except Exception as exc:  # network issues, bad JSON, missing package, etc.
+        fallback = _local_fallback_explainer(kpi_summary, anomalies, predictions)
+        fallback["_note"] = f"GenAI call failed ({exc.__class__.__name__}: {exc}); showing local fallback analysis."
+        return fallback
+
+
+def print_report(report: dict[str, Any]) -> None:
+    """Pretty-prints a farmer report dict to the console."""
+    status_emoji = {
+        "healthy": "✅", "watch": "🟡", "needs_attention": "🟠", "urgent": "🔴",
+    }
+    print(f"\n{status_emoji.get(report.get('overall_status'), '')} "
+          f"Overall status: {report.get('overall_status', 'unknown').upper()}")
+    print(f"\n{report.get('summary', '')}\n")
+
+    for issue in report.get("issues", []):
+        print(f"--- {issue.get('title')} [{issue.get('urgency', '').upper()}] ---")
+        print(issue.get("explanation", ""))
+        for rec in issue.get("recommendations", []):
+            print(f"  -> {rec}")
+        print()
+
+    if report.get("positive_notes"):
+        print("Good signs:")
+        for note in report["positive_notes"]:
+            print(f"  + {note}")
+
+    if report.get("_note"):
+        print(f"\n[{report['_note']}]")
+
+
+if __name__ == "__main__":
+    from data_simulator import simulate_farm_data
+    from kpi_engine import compute_daily_kpis, summarize_batch
+    from anomaly_detector import detect_anomalies
+    from problem_predictor import predict_problems
+
+    raw = simulate_farm_data()
+    kpis = compute_daily_kpis(raw)
+    summary = summarize_batch(kpis)
+    anomalies_df = detect_anomalies(kpis)
+    anomalies = anomalies_df.to_dict("records")
+    predictions = predict_problems(kpis)
+
+    report = generate_farmer_report(summary, anomalies, predictions)
+    print_report(report)
