@@ -1,0 +1,88 @@
+BEGIN;
+
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+CREATE EXTENSION IF NOT EXISTS citext;
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+
+CREATE SCHEMA IF NOT EXISTS medibridge;
+SET search_path TO medibridge, public;
+
+CREATE TYPE user_role AS ENUM ('PATIENT','DOCTOR','HOSPITAL','LAB','PHARMACY','THERAPIST','AMBULANCE','ADMIN');
+CREATE TYPE account_status AS ENUM ('PENDING','ACTIVE','SUSPENDED','DISABLED');
+CREATE TYPE verification_status AS ENUM ('PENDING','VERIFIED','REJECTED','EXPIRED');
+CREATE TYPE availability_status AS ENUM ('CONFIRMED','ESTIMATED','UNAVAILABLE','UNKNOWN');
+CREATE TYPE price_status AS ENUM ('VERIFIED','ESTIMATED','UNKNOWN');
+CREATE TYPE appointment_status AS ENUM ('SCHEDULED','CONFIRMED','CHECKED_IN','IN_PROGRESS','COMPLETED','CANCELLED','MISSED','RESCHEDULED');
+CREATE TYPE record_type AS ENUM ('MEDICAL_HISTORY','CONSULTATION','DISCHARGE_SUMMARY','LAB_REPORT','IMAGING','PRESCRIPTION','VACCINATION','OTHER');
+CREATE TYPE consent_scope AS ENUM ('MEDICAL_HISTORY','CONSULTATION','DISCHARGE_SUMMARY','LAB_REPORT','IMAGING','PRESCRIPTION','VACCINATION','OTHER','LAB_REPORTS','PRESCRIPTIONS','EMERGENCY_INFORMATION','FULL_RECORD');
+CREATE TYPE consent_status AS ENUM ('ACTIVE','EXPIRED','REVOKED');
+CREATE TYPE payment_status AS ENUM ('PENDING','SUCCESS','FAILED','REFUNDED');
+CREATE TYPE emergency_status AS ENUM ('CREATED','SEARCHING','HOSPITAL_SELECTED','AMBULANCE_REQUESTED','AMBULANCE_ASSIGNED','EN_ROUTE','ARRIVED','PATIENT_PICKED_UP','AT_HOSPITAL','COMPLETED','CANCELLED');
+CREATE TYPE provider_type AS ENUM ('DOCTOR','HOSPITAL','LABORATORY','PHARMACY','THERAPIST','AMBULANCE');
+CREATE TYPE notification_channel AS ENUM ('PUSH','SMS','EMAIL','IN_APP');
+CREATE TYPE notification_type AS ENUM ('APPOINTMENT','REMINDER','EMERGENCY','LAB_REPORT','PRESCRIPTION','PAYMENT','SYSTEM');
+CREATE TYPE access_type AS ENUM ('VIEW','DOWNLOAD','SHARE','UPDATE');
+
+CREATE OR REPLACE FUNCTION set_updated_at() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN NEW.updated_at = clock_timestamp(); RETURN NEW; END; $$;
+
+CREATE TABLE users (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  email citext UNIQUE,
+  phone varchar(32) UNIQUE,
+  password_hash text,
+  external_auth_id text UNIQUE,
+  role user_role NOT NULL,
+  status account_status NOT NULL DEFAULT 'PENDING',
+  created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+  updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+  last_login_at timestamptz,
+  CONSTRAINT users_auth_method_ck CHECK (password_hash IS NOT NULL OR external_auth_id IS NOT NULL),
+  CONSTRAINT users_contact_ck CHECK (email IS NOT NULL OR phone IS NOT NULL)
+);
+CREATE INDEX users_role_idx ON users(role);
+CREATE INDEX users_status_idx ON users(status);
+CREATE TRIGGER users_updated_at BEFORE UPDATE ON users FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+CREATE TABLE addresses (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  address_line text NOT NULL,
+  city varchar(120) NOT NULL,
+  district varchar(120), state varchar(120), country char(2) NOT NULL DEFAULT 'IN',
+  postal_code varchar(20), latitude numeric(9,6), longitude numeric(9,6),
+  created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+  updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+  deleted_at timestamptz,
+  CONSTRAINT addresses_lat_ck CHECK (latitude IS NULL OR latitude BETWEEN -90 AND 90),
+  CONSTRAINT addresses_lon_ck CHECK (longitude IS NULL OR longitude BETWEEN -180 AND 180)
+);
+CREATE INDEX addresses_lat_lon_idx ON addresses(latitude, longitude) WHERE deleted_at IS NULL;
+CREATE TRIGGER addresses_updated_at BEFORE UPDATE ON addresses FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+CREATE TABLE emergency_contacts (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(), patient_id uuid NOT NULL,
+  full_name text NOT NULL, relationship varchar(80) NOT NULL, phone varchar(32) NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT clock_timestamp(), updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+  deleted_at timestamptz
+);
+
+CREATE TABLE patients (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(), user_id uuid NOT NULL UNIQUE REFERENCES users(id),
+  first_name varchar(120) NOT NULL, last_name varchar(120) NOT NULL, date_of_birth date NOT NULL,
+  gender varchar(50), blood_group varchar(4), profile_photo_url text, preferred_language varchar(16) NOT NULL DEFAULT 'en',
+  address_id uuid REFERENCES addresses(id), emergency_contact_id uuid,
+  created_at timestamptz NOT NULL DEFAULT clock_timestamp(), updated_at timestamptz NOT NULL DEFAULT clock_timestamp(), deleted_at timestamptz,
+  CONSTRAINT patient_dob_ck CHECK (date_of_birth <= CURRENT_DATE),
+  CONSTRAINT patient_blood_group_ck CHECK (blood_group IS NULL OR blood_group IN ('A+','A-','B+','B-','AB+','AB-','O+','O-')),
+  CONSTRAINT patient_emergency_contact_fk FOREIGN KEY (emergency_contact_id) REFERENCES emergency_contacts(id)
+);
+ALTER TABLE emergency_contacts ADD CONSTRAINT emergency_contacts_patient_fk FOREIGN KEY (patient_id) REFERENCES patients(id) DEFERRABLE INITIALLY DEFERRED;
+CREATE INDEX patients_user_id_idx ON patients(user_id);
+CREATE TRIGGER emergency_contacts_updated_at BEFORE UPDATE ON emergency_contacts FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+CREATE TRIGGER patients_updated_at BEFORE UPDATE ON patients FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+COMMENT ON SCHEMA medibridge IS 'MediBridge AI healthcare data model. PHI access is controlled through RLS and application request context.';
+COMMENT ON COLUMN users.password_hash IS 'Argon2id or bcrypt output only; plaintext passwords are prohibited.';
+COMMENT ON COLUMN addresses.latitude IS 'WGS84 decimal degrees. Use PostGIS geography in a future geospatial migration for high-volume radius queries.';
+COMMIT;
