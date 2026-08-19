@@ -1,0 +1,159 @@
+"""
+data_simulator.py
+------------------
+Generates a realistic synthetic daily-log dataset for a poultry (broiler) farm.
+Use this to test the pipeline end-to-end without needing real farm data.
+
+Columns produced:
+    date                 : calendar date of the log entry
+    day_of_batch         : age of the flock in days (1 = day of placement)
+    bird_population      : live bird count at start of day
+    mortality            : birds that died that day
+    feed_consumed_kg     : total feed consumed that day (kg)
+    water_consumed_l     : total water consumed that day (litres)
+    avg_body_weight_g    : average bird body weight (grams)
+    temperature_c        : average house temperature (Celsius)
+    humidity_pct         : average house relative humidity (%)
+    production_units     : eggs collected (layers) OR kg meat equivalent (broilers)
+"""
+
+import numpy as np
+import pandas as pd
+
+
+def simulate_farm_data(
+    n_days: int = 42,
+    start_population: int = 10000,
+    start_date: str = "2026-01-01",
+    inject_anomalies: bool = True,
+    random_seed: int = 42,
+) -> pd.DataFrame:
+    """
+    Simulate a daily poultry log for a single broiler batch.
+
+    Parameters
+    ----------
+    n_days : number of days to simulate (typical broiler cycle ~35-42 days)
+    start_population : birds placed on day 1
+    start_date : ISO date string for day 1
+    inject_anomalies : if True, deliberately injects a few realistic problem
+                        events (disease spike, heat stress, water line fault)
+                        so the anomaly detector / predictor have something to find
+    random_seed : for reproducibility
+
+    Returns
+    -------
+    pd.DataFrame indexed by day, one row per day
+    """
+    rng = np.random.default_rng(random_seed)
+    dates = pd.date_range(start=start_date, periods=n_days, freq="D")
+
+    population = np.zeros(n_days, dtype=int)
+    mortality = np.zeros(n_days, dtype=int)
+    feed_kg = np.zeros(n_days)
+    water_l = np.zeros(n_days)
+    body_weight_g = np.zeros(n_days)
+    temperature_c = np.zeros(n_days)
+    humidity_pct = np.zeros(n_days)
+    production_units = np.zeros(n_days)
+
+    population[0] = start_population
+    body_weight_g[0] = 42.0  # typical day-old chick weight
+
+    # baseline growth curve parameters (simplified Gompertz-like growth)
+    for d in range(n_days):
+        day_num = d + 1
+
+        # --- baseline mortality: ~0.2-0.4% daily, slightly higher in week 1 ---
+        base_mort_rate = 0.004 if day_num <= 7 else 0.0018
+        daily_mortality = rng.binomial(population[d], base_mort_rate)
+        mortality[d] = daily_mortality
+
+        if d + 1 < n_days:
+            population[d + 1] = population[d] - daily_mortality
+
+        # --- body weight growth (grams), typical broiler curve ---
+        if d > 0:
+            daily_gain = 8 + 2.1 * d - 0.018 * d ** 2
+            daily_gain = max(daily_gain, 5)
+            body_weight_g[d] = body_weight_g[d - 1] + daily_gain + rng.normal(0, 1.5)
+
+        # --- feed consumption scales with body weight and population ---
+        feed_per_bird_g = 0.045 * body_weight_g[d] + rng.normal(0, 1.0)
+        feed_kg[d] = max(feed_per_bird_g, 1.0) * population[d] / 1000.0
+
+        # --- water consumption ~= 1.8x feed by weight, temp-sensitive ---
+        temperature_c[d] = 32 - 0.35 * d + rng.normal(0, 0.8)
+        temperature_c[d] = max(temperature_c[d], 21)
+        temp_factor = 1 + max(0, (temperature_c[d] - 28)) * 0.04
+        water_l[d] = feed_kg[d] * 1.8 * temp_factor + rng.normal(0, 2)
+
+        humidity_pct[d] = 60 + rng.normal(0, 4)
+        humidity_pct[d] = np.clip(humidity_pct[d], 40, 85)
+
+        # --- production_units: relevant for layer flocks; kept for schema
+        # completeness. For broilers this can be interpreted as kg live
+        # weight produced that day (population * weight gain).
+        if d > 0:
+            production_units[d] = population[d] * (body_weight_g[d] - body_weight_g[d - 1]) / 1000.0
+
+    df = pd.DataFrame({
+        "date": dates,
+        "day_of_batch": np.arange(1, n_days + 1),
+        "bird_population": population,
+        "mortality": mortality,
+        "feed_consumed_kg": np.round(feed_kg, 2),
+        "water_consumed_l": np.round(water_l, 2),
+        "avg_body_weight_g": np.round(body_weight_g, 1),
+        "temperature_c": np.round(temperature_c, 1),
+        "humidity_pct": np.round(humidity_pct, 1),
+        "production_units": np.round(production_units, 2),
+    })
+
+    if inject_anomalies:
+        df = _inject_problem_events(df, rng)
+
+    return df
+
+
+def _inject_problem_events(df: pd.DataFrame, rng: np.random.Generator) -> pd.DataFrame:
+    """
+    Injects a few realistic 'problem events' into the middle/late part of the
+    batch so downstream anomaly detection and GenAI explanation have real
+    signal to work with:
+      1. A disease/heat-stress mortality spike (days 20-22)
+      2. A water line fault causing a consumption drop (days 27-28)
+      3. A feed supply disruption causing reduced intake (days 33-34)
+    """
+    n_days = len(df)
+
+    # Event 1: mortality spike + weight gain stall (simulated disease outbreak)
+    if n_days > 22:
+        for idx in [19, 20, 21]:  # days 20-22 (0-indexed)
+            spike = int(df.loc[idx, "bird_population"] * rng.uniform(0.015, 0.028))
+            df.loc[idx, "mortality"] += spike
+            df.loc[idx:, "bird_population"] = (
+                df.loc[idx:, "bird_population"] - spike
+            )
+            df.loc[idx, "avg_body_weight_g"] *= 0.97  # weight check/stall
+
+    # Event 2: water line fault -> water consumption drops sharply
+    if n_days > 28:
+        for idx in [26, 27]:
+            df.loc[idx, "water_consumed_l"] *= rng.uniform(0.55, 0.68)
+
+    # Event 3: feed supply disruption -> feed intake drops, temp rises (stress)
+    if n_days > 34:
+        for idx in [32, 33]:
+            df.loc[idx, "feed_consumed_kg"] *= rng.uniform(0.6, 0.72)
+            df.loc[idx, "temperature_c"] += rng.uniform(2.5, 4.0)
+
+    return df.reset_index(drop=True)
+
+
+if __name__ == "__main__":
+    data = simulate_farm_data()
+    out_path = "sample_farm_data.csv"
+    data.to_csv(out_path, index=False)
+    print(f"Simulated {len(data)} days of farm data -> {out_path}")
+    print(data.head(10).to_string(index=False))
