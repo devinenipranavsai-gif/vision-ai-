@@ -1,0 +1,149 @@
+"""
+anomaly_detector.py
+--------------------
+Detects abnormal patterns in daily poultry farm data using a combination of:
+  1. Rolling z-score analysis (statistical outliers vs recent trend)
+  2. Rule-based thresholds (industry-standard "red flag" values)
+
+No ML training is required — this is intentional. Farm anomaly detection
+needs to work from day 1 of a new batch with no historical training set,
+so statistical + rule-based methods are the right tool.
+"""
+
+from __future__ import annotations
+import numpy as np
+import pandas as pd
+
+
+# Industry-informed rule-of-thumb thresholds. Adjust per breed/region/SOP.
+THRESHOLDS = {
+    "daily_mortality_rate_pct": 0.5,     # >0.5%/day is a red flag for broilers
+    "temperature_c_high": 33.0,
+    "temperature_c_low": 18.0,
+    "humidity_pct_high": 75.0,
+    "humidity_pct_low": 40.0,
+    "water_feed_ratio_low": 1.5,         # birds drinking too little relative to feed
+    "water_feed_ratio_high": 2.4,        # possible water line leak / disease
+}
+
+ROLLING_WINDOW = 5      # days used to establish the "recent normal" baseline
+Z_SCORE_THRESHOLD = 2.5  # values beyond this many std-devs are flagged
+
+
+def _rolling_zscore(series: pd.Series, window: int = ROLLING_WINDOW) -> pd.Series:
+    """Z-score of each point vs. the trailing rolling mean/std (excluding itself)."""
+    roll_mean = series.shift(1).rolling(window=window, min_periods=3).mean()
+    roll_std = series.shift(1).rolling(window=window, min_periods=3).std()
+    z = (series - roll_mean) / roll_std.replace(0, np.nan)
+    return z
+
+
+def detect_anomalies(kpi_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Takes a KPI-enriched DataFrame (output of kpi_engine.compute_daily_kpis)
+    and returns a DataFrame of flagged anomalies, one row per detected event,
+    with columns: day_of_batch, date, metric, value, method, severity, detail
+    """
+    records = []
+
+    metrics_for_zscore = [
+        "mortality", "feed_consumed_kg", "water_consumed_l",
+        "avg_body_weight_g", "temperature_c", "humidity_pct",
+    ]
+
+    for metric in metrics_for_zscore:
+        z = _rolling_zscore(kpi_df[metric])
+        flagged = kpi_df[z.abs() >= Z_SCORE_THRESHOLD]
+        for idx in flagged.index:
+            direction = "spike" if z.loc[idx] > 0 else "drop"
+            records.append({
+                "day_of_batch": int(kpi_df.loc[idx, "day_of_batch"]),
+                "date": kpi_df.loc[idx, "date"],
+                "metric": metric,
+                "value": float(kpi_df.loc[idx, metric]),
+                "method": "rolling_zscore",
+                "severity": "high" if abs(z.loc[idx]) >= 3.5 else "medium",
+                "detail": f"{metric} showed an unusual {direction} "
+                          f"(z={z.loc[idx]:.2f}) vs the prior {ROLLING_WINDOW}-day trend.",
+            })
+
+    # --- Rule-based threshold checks ---
+    for idx, row in kpi_df.iterrows():
+        if row["daily_mortality_rate_pct"] > THRESHOLDS["daily_mortality_rate_pct"]:
+            records.append({
+                "day_of_batch": int(row["day_of_batch"]),
+                "date": row["date"],
+                "metric": "daily_mortality_rate_pct",
+                "value": float(row["daily_mortality_rate_pct"]),
+                "method": "threshold",
+                "severity": "high" if row["daily_mortality_rate_pct"] > 1.0 else "medium",
+                "detail": f"Daily mortality rate of {row['daily_mortality_rate_pct']:.2f}% "
+                          f"exceeds the {THRESHOLDS['daily_mortality_rate_pct']}% red-flag threshold.",
+            })
+
+        if row["temperature_c"] > THRESHOLDS["temperature_c_high"]:
+            records.append({
+                "day_of_batch": int(row["day_of_batch"]),
+                "date": row["date"],
+                "metric": "temperature_c",
+                "value": float(row["temperature_c"]),
+                "method": "threshold",
+                "severity": "high",
+                "detail": f"House temperature of {row['temperature_c']:.1f}\u00b0C exceeds heat-stress "
+                          f"threshold of {THRESHOLDS['temperature_c_high']}\u00b0C.",
+            })
+        elif row["temperature_c"] < THRESHOLDS["temperature_c_low"]:
+            records.append({
+                "day_of_batch": int(row["day_of_batch"]),
+                "date": row["date"],
+                "metric": "temperature_c",
+                "value": float(row["temperature_c"]),
+                "method": "threshold",
+                "severity": "high",
+                "detail": f"House temperature of {row['temperature_c']:.1f}\u00b0C is below the "
+                          f"cold-stress threshold of {THRESHOLDS['temperature_c_low']}\u00b0C.",
+            })
+
+        wfr = row["water_feed_ratio"]
+        if wfr > 0 and wfr < THRESHOLDS["water_feed_ratio_low"]:
+            records.append({
+                "day_of_batch": int(row["day_of_batch"]),
+                "date": row["date"],
+                "metric": "water_feed_ratio",
+                "value": float(wfr),
+                "method": "threshold",
+                "severity": "medium",
+                "detail": f"Water:Feed ratio of {wfr:.2f} is unusually low "
+                          f"(expected roughly 1.8-2.0) — check water access/lines.",
+            })
+        elif wfr > THRESHOLDS["water_feed_ratio_high"]:
+            records.append({
+                "day_of_batch": int(row["day_of_batch"]),
+                "date": row["date"],
+                "metric": "water_feed_ratio",
+                "value": float(wfr),
+                "method": "threshold",
+                "severity": "medium",
+                "detail": f"Water:Feed ratio of {wfr:.2f} is unusually high — "
+                          f"possible leak, heat stress, or early disease sign.",
+            })
+
+    if not records:
+        return pd.DataFrame(columns=[
+            "day_of_batch", "date", "metric", "value", "method", "severity", "detail"
+        ])
+
+    anomalies = pd.DataFrame(records)
+    anomalies = anomalies.sort_values(["day_of_batch", "severity"]).reset_index(drop=True)
+    return anomalies
+
+
+if __name__ == "__main__":
+    from data_simulator import simulate_farm_data
+    from kpi_engine import compute_daily_kpis
+
+    raw = simulate_farm_data()
+    kpis = compute_daily_kpis(raw)
+    anomalies = detect_anomalies(kpis)
+    print(f"Detected {len(anomalies)} anomalies:\n")
+    print(anomalies.to_string(index=False))
