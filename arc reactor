@@ -1,0 +1,381 @@
+"""
+ARC REACTOR PROP ASSEMBLY - PARAMETRIC FREECAD MACRO
+======================================================
+Iron Man-style wearable/display arc reactor, built for FDM 3D printing.
+
+HOW TO RUN
+----------
+1. Open FreeCAD (0.20+ recommended).
+2. Macro -> Macros... -> Add this file (or paste into the Python console).
+3. Execute. A new document "ArcReactor" is created with every solid.
+4. The script auto-exports:
+     - One STL per component  -> ./output/stl/*.stl
+     - One assembled STEP     -> ./output/ArcReactor_Assembly.step
+   (edit OUT_DIR below if you want files elsewhere)
+
+SIZE VARIANTS
+-------------
+Set OD_MODE below to 65 (wearable chest-piece), 80 (default), or 120
+(desk display). Every dimension scales proportionally EXCEPT the FDM
+print tolerances (ring clearance, screw clearance), which stay fixed
+in mm regardless of scale, and the M3 hardware, which is a real screw
+size and never scales.
+
+ASSEMBLY / Z-STACK (see arc_reactor_design_notes.md for the diagram)
+---------------------------------------------------------------------
+z=0..10   Battery/driver boss behind the back plate (10mm deep)
+z=10..13  Back plate (3mm thick)
+z=13..25  Outer housing ring (12mm tall)      <- front face is z=25
+z=15..23  Mid ring (recessed 2mm from housing front, 8mm tall)
+z=15..21  Inner diffuser ring (6mm tall, inside mid ring bore)
+z=21..23  Central triangle core face (2mm thick, at the very front)
+z=13..21  Core LED recess cavity (dia 15 x 8 deep), behind the core
+z=3..13   Electronics cavity (dia 25 x 10 deep), driver board/battery
+Total stack depth: 25mm (matches spec). All parts share the Z axis.
+"""
+
+import os, math
+import FreeCAD as App
+import Part
+import Mesh
+
+# ---------------------------------------------------------------------
+# PARAMETERS
+# ---------------------------------------------------------------------
+OD_MODE = 80.0          # 65 = wearable, 80 = default, 120 = desk display
+SCALE   = OD_MODE / 80.0
+
+def S(v):
+    """Scale a nominal (80mm-reference) dimension."""
+    return v * SCALE
+
+# --- Outer housing ring ---
+OUTER_OD   = S(80.0)
+OUTER_ID   = S(74.0)
+OUTER_H    = S(12.0)
+
+# --- Mid ring (rotating collar) ---
+MID_OD     = S(70.0)
+MID_ID     = S(60.0)
+MID_H      = S(8.0)
+MID_RECESS = S(2.0)
+MID_NOTCH_EVERY_DEG = 15.0          # tick notches, angle does NOT scale
+
+# --- Inner diffuser ring ---
+DIFF_OD    = S(58.0)
+DIFF_ID    = S(40.0)
+DIFF_H     = S(6.0)
+DIFF_THIN_WALL = True               # True: hollow to a 1.5mm translucent wall
+DIFF_WALL  = 1.5                    # wall thickness does NOT scale (print wall)
+
+# --- Central triangle core ---
+CORE_SIDE     = S(30.0)
+CORE_FILLET_R = 2.0                 # corner radius, fixed (small feature)
+CORE_THICK    = 2.0                 # fixed - thin acrylic-look face
+CAVITY_DIA    = S(15.0)
+CAVITY_DEPTH  = 8.0                 # fixed depth for standard LED puck / coin cell
+
+# --- Back plate ---
+BACK_DIA      = S(78.0)
+BACK_THICK    = 3.0                 # fixed
+BACK_HOLE_DIA = S(20.0)
+
+# --- Electronics cavity + wiring ---
+ELEC_CAVITY_DIA   = S(25.0)
+ELEC_CAVITY_DEPTH = 10.0            # fixed
+WIRE_CHANNEL_DIA  = 3.0             # fixed
+
+# --- Battery compartment (behind back plate) ---
+BATT_CAVITY = (20.0, 30.0, 10.0)    # L x W x depth, fixed (standard cell sizes)
+BATT_WALL   = 3.0
+BATT_OFFSET_Y = 12.0                # shift off-axis so it clears the wire hole
+
+# --- Mounting hardware ---
+TAB_COUNT     = 6
+M3_HOLE_DIA   = 3.3                 # 3.0 + 0.3mm clearance per spec
+TAB_BOSS_DIA  = 8.0
+TAB_RADIUS    = OUTER_ID / 2.0 - 4.0   # bolt circle, inset from housing ID
+
+# --- Print tolerances (fixed, not scaled) ---
+RING_CLEARANCE = 0.2   # radial clearance between press-fit concentric rings
+
+# --- Greebling ---
+HEX_BOLT_COUNT   = 12
+HEX_ACROSS_FLATS = 4.0
+HEX_RAISE        = 1.0
+PANEL_LINE_DEPTH = 1.0
+PANEL_RADIAL_LINES = 6
+
+OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)) if "__file__" in dir() else os.getcwd(), "output")
+STL_DIR = os.path.join(OUT_DIR, "stl")
+
+
+# ---------------------------------------------------------------------
+# HELPERS
+# ---------------------------------------------------------------------
+def cyl(r, h, base=App.Vector(0, 0, 0), axis=App.Vector(0, 0, 1)):
+    return Part.makeCylinder(r, h, base, axis)
+
+def ring(od, idia, h, base=App.Vector(0, 0, 0)):
+    outer = cyl(od / 2.0, h, base)
+    inner = cyl(idia / 2.0, h, base)
+    return outer.cut(inner)
+
+def hex_prism(across_flats, height, base):
+    """Hex bolt head, flat-to-flat = across_flats."""
+    r = across_flats / math.sqrt(3.0)  # circumradius for given across-flats
+    pts = []
+    for i in range(6):
+        a = math.radians(60 * i + 30)
+        pts.append(App.Vector(r * math.cos(a), r * math.sin(a), 0))
+    pts.append(pts[0])
+    wire = Part.makePolygon(pts)
+    face = Part.Face(wire)
+    solid = face.extrude(App.Vector(0, 0, height))
+    solid.translate(base)
+    return solid
+
+def rounded_triangle_prism(side, fillet_r, height, base):
+    """Equilateral triangle, extruded, with vertical edges filleted."""
+    R = side / math.sqrt(3.0)  # circumradius
+    pts = []
+    for i in range(3):
+        a = math.radians(90 + 120 * i)  # point-up triangle
+        pts.append(App.Vector(R * math.cos(a), R * math.sin(a), 0))
+    pts.append(pts[0])
+    wire = Part.makePolygon(pts)
+    face = Part.Face(wire)
+    solid = face.extrude(App.Vector(0, 0, height))
+    vertical_edges = [
+        e for e in solid.Edges
+        if abs(e.Vertexes[0].Point.x - e.Vertexes[1].Point.x) < 1e-6
+        and abs(e.Vertexes[0].Point.y - e.Vertexes[1].Point.y) < 1e-6
+    ]
+    try:
+        solid = solid.makeFillet(fillet_r, vertical_edges)
+    except Exception as ex:
+        App.Console.PrintWarning("Triangle fillet skipped: %s\n" % ex)
+    solid.translate(base)
+    return solid
+
+def circular_pattern(shape, count, radius, z, start_deg=0.0):
+    """Return a compound of `shape` copies placed on a bolt circle."""
+    copies = []
+    for i in range(count):
+        ang = start_deg + i * (360.0 / count)
+        x = radius * math.cos(math.radians(ang))
+        y = radius * math.sin(math.radians(ang))
+        c = shape.copy()
+        c.translate(App.Vector(x, y, z))
+        copies.append(c)
+    return Part.makeCompound(copies)
+
+
+# ---------------------------------------------------------------------
+# 1. OUTER HOUSING RING (with tabs, greebling)
+# ---------------------------------------------------------------------
+def build_outer_housing():
+    z0 = 13.0 * SCALE if False else 13.0  # ring sits z=13..25 in absolute stack (fixed, not scaled)
+    base = App.Vector(0, 0, z0)
+    housing = ring(OUTER_OD, OUTER_ID, OUTER_H, base)
+
+    # -- 6 mounting tab bosses (fused pads on the inner wall, rear side) --
+    boss_h = 6.0
+    boss = cyl(TAB_BOSS_DIA / 2.0, boss_h, App.Vector(0, 0, z0))
+    bosses = circular_pattern(boss, TAB_COUNT, TAB_RADIUS, 0)
+    housing = housing.fuse(bosses)
+
+    hole = cyl(M3_HOLE_DIA / 2.0, boss_h + 2, App.Vector(0, 0, z0 - 1))
+    holes = circular_pattern(hole, TAB_COUNT, TAB_RADIUS, 0)
+    housing = housing.cut(holes)
+
+    # -- greeble: hex bolt heads around the front rim --
+    bolt_radius = OUTER_OD / 2.0 - 4.0
+    bolt = hex_prism(HEX_ACROSS_FLATS, HEX_RAISE, App.Vector(0, 0, z0 + OUTER_H))
+    bolts = circular_pattern(bolt, HEX_BOLT_COUNT, bolt_radius, 0)
+    housing = housing.fuse(bolts)
+
+    # -- greeble: recessed circumferential panel lines (outer wall) --
+    for frac in (0.3, 0.55, 0.8):
+        groove_z = z0 + OUTER_H * frac
+        outer_c = cyl(OUTER_OD / 2.0 + 1, PANEL_LINE_DEPTH * 2,
+                       App.Vector(0, 0, groove_z))
+        inner_c = cyl(OUTER_OD / 2.0 - PANEL_LINE_DEPTH, PANEL_LINE_DEPTH * 2,
+                       App.Vector(0, 0, groove_z))
+        groove = outer_c.cut(inner_c)
+        try:
+            housing = housing.cut(groove)
+        except Exception:
+            pass
+
+    # -- greeble: radial segmented panel lines on the front face --
+    for i in range(PANEL_RADIAL_LINES):
+        ang = i * (360.0 / PANEL_RADIAL_LINES)
+        slot = Part.makeBox(OUTER_OD, 1.2, PANEL_LINE_DEPTH,
+                             App.Vector(-1, -0.6, z0 + OUTER_H - PANEL_LINE_DEPTH))
+        slot.rotate(App.Vector(0, 0, 0), App.Vector(0, 0, 1), ang)
+        ring_mask = ring(OUTER_OD, OUTER_ID, PANEL_LINE_DEPTH,
+                          App.Vector(0, 0, z0 + OUTER_H - PANEL_LINE_DEPTH))
+        try:
+            slot = slot.common(ring_mask)
+            housing = housing.cut(slot)
+        except Exception:
+            pass
+
+    return housing
+
+
+# ---------------------------------------------------------------------
+# 2. MID RING (rotating collar, with tick notches)
+# ---------------------------------------------------------------------
+def build_mid_ring():
+    z0 = 25.0 - MID_RECESS - MID_H  # recessed 2mm from housing front (z=25)
+    r = ring(MID_OD, MID_ID, MID_H, App.Vector(0, 0, z0))
+
+    notch = Part.makeBox(1.2, 1.2, 1.2, App.Vector(MID_OD / 2.0 - 0.6, -0.6, z0))
+    count = int(360 / MID_NOTCH_EVERY_DEG)
+    notches = circular_pattern(notch, count, 0, 0)  # radius 0: notch already placed at radius via its own X offset
+    # circular_pattern rotates about origin, so re-place using rotation of the notch itself:
+    copies = []
+    for i in range(count):
+        ang = i * MID_NOTCH_EVERY_DEG
+        c = notch.copy()
+        c.rotate(App.Vector(0, 0, 0), App.Vector(0, 0, 1), ang)
+        copies.append(c)
+    notches = Part.makeCompound(copies)
+    try:
+        r = r.cut(notches)
+    except Exception:
+        pass
+    return r
+
+
+# ---------------------------------------------------------------------
+# 3. INNER DIFFUSER RING (translucent)
+# ---------------------------------------------------------------------
+def build_diffuser_ring():
+    z0 = 15.0
+    if DIFF_THIN_WALL:
+        outer_r = DIFF_OD / 2.0
+        inner_r = outer_r - DIFF_WALL
+        shape = ring(DIFF_OD, inner_r * 2.0, DIFF_H, App.Vector(0, 0, z0))
+    else:
+        shape = ring(DIFF_OD, DIFF_ID, DIFF_H, App.Vector(0, 0, z0))
+    return shape
+
+
+# ---------------------------------------------------------------------
+# 4. CENTRAL TRIANGLE CORE (+ LED recess cavity, cut into assembly separately)
+# ---------------------------------------------------------------------
+def build_core_face():
+    z0 = 21.0
+    return rounded_triangle_prism(CORE_SIDE, CORE_FILLET_R, CORE_THICK,
+                                   App.Vector(0, 0, z0))
+
+def build_core_cavity_cutter():
+    """LED puck / coin-cell recess, behind the core face."""
+    z0 = 13.0
+    depth = 21.0 - 13.0  # up to the back of the core face -> 8mm, matches spec
+    return cyl(CAVITY_DIA / 2.0, depth, App.Vector(0, 0, z0))
+
+
+# ---------------------------------------------------------------------
+# 5. BACK PLATE (+ battery compartment boss)
+# ---------------------------------------------------------------------
+def build_back_plate():
+    z0 = 10.0
+    plate = cyl(BACK_DIA / 2.0, BACK_THICK, App.Vector(0, 0, z0))
+    center_hole = cyl(BACK_HOLE_DIA / 2.0, BACK_THICK + 2, App.Vector(0, 0, z0 - 1))
+    plate = plate.cut(center_hole)
+
+    hole = cyl(M3_HOLE_DIA / 2.0, BACK_THICK + 2, App.Vector(0, 0, z0 - 1))
+    holes = circular_pattern(hole, TAB_COUNT, TAB_RADIUS, 0)
+    plate = plate.cut(holes)
+    return plate
+
+def build_battery_boss():
+    """Boss behind the back plate housing the battery compartment (z=0..10)."""
+    L, W, D = BATT_CAVITY
+    outer = Part.makeBox(L + 2 * BATT_WALL, W + 2 * BATT_WALL, D,
+                          App.Vector(-(L / 2.0 + BATT_WALL),
+                                     BATT_OFFSET_Y - (W / 2.0 + BATT_WALL), 0))
+    cavity = Part.makeBox(L, W, D - BATT_WALL,
+                           App.Vector(-L / 2.0, BATT_OFFSET_Y - W / 2.0, BATT_WALL))
+    boss = outer.cut(cavity)
+    return boss
+
+def build_battery_cover():
+    """Friction-fit cover, separate printable part."""
+    L, W, D = BATT_CAVITY
+    lip = 0.2  # press-fit clearance
+    cover = Part.makeBox(L + 2 * BATT_WALL - 2 * lip, W + 2 * BATT_WALL - 2 * lip, 1.5,
+                          App.Vector(-(L / 2.0 + BATT_WALL - lip),
+                                     BATT_OFFSET_Y - (W / 2.0 + BATT_WALL - lip), -1.5))
+    return cover
+
+
+# ---------------------------------------------------------------------
+# ELECTRONICS CAVITY + WIRE CHANNEL (cut into the housing/back-plate stack)
+# ---------------------------------------------------------------------
+def build_electronics_cutter():
+    z0 = 3.0
+    cavity = cyl(ELEC_CAVITY_DIA / 2.0, ELEC_CAVITY_DEPTH, App.Vector(0, 0, z0))
+    channel = cyl(WIRE_CHANNEL_DIA / 2.0, OUTER_OD, App.Vector(0, 0, z0 + ELEC_CAVITY_DEPTH / 2.0),
+                   axis=App.Vector(1, 0, 0))
+    return cavity.fuse(channel)
+
+
+# ---------------------------------------------------------------------
+# BUILD DOCUMENT
+# ---------------------------------------------------------------------
+def main():
+    doc = App.newDocument("ArcReactor")
+
+    outer_housing = build_outer_housing()
+    mid_ring = build_mid_ring()
+    diffuser_ring = build_diffuser_ring()
+    core_face = build_core_face()
+    back_plate = build_back_plate()
+    battery_boss = build_battery_boss()
+    battery_cover = build_battery_cover()
+
+    # Electronics cavity + core LED recess are cut out of the housing/back-plate
+    elec_cutter = build_electronics_cutter()
+    core_cavity_cutter = build_core_cavity_cutter()
+    outer_housing = outer_housing.cut(elec_cutter).cut(core_cavity_cutter)
+    back_plate = back_plate.cut(elec_cutter)
+    battery_boss = battery_boss.cut(elec_cutter)
+
+    parts = {
+        "01_OuterHousing": outer_housing,
+        "02_MidRing": mid_ring,
+        "03_DiffuserRing": diffuser_ring,
+        "04_CoreFace": core_face,
+        "05_BackPlate": back_plate,
+        "06_BatteryBoss": battery_boss,
+        "07_BatteryCover": battery_cover,
+    }
+
+    objs = []
+    for name, shape in parts.items():
+        obj = doc.addObject("Part::Feature", name)
+        obj.Shape = shape
+        objs.append(obj)
+    doc.recompute()
+
+    os.makedirs(STL_DIR, exist_ok=True)
+    for name, shape in parts.items():
+        Mesh.export([doc.getObject(name)], os.path.join(STL_DIR, name + ".stl"))
+
+    Part.export(objs, os.path.join(OUT_DIR, "ArcReactor_Assembly.step"))
+
+    App.Console.PrintMessage("Arc reactor build complete.\n")
+    App.Console.PrintMessage("STL files:  %s\n" % STL_DIR)
+    App.Console.PrintMessage("STEP file:  %s\n" % os.path.join(OUT_DIR, "ArcReactor_Assembly.step"))
+
+    doc.recompute()
+    return doc
+
+
+if __name__ == "__main__":
+    main()
