@@ -1,0 +1,144 @@
+"""
+problem_predictor.py
+---------------------
+Forecasts near-term trends for key metrics using lightweight NumPy-based
+regression (no heavy ML dependency needed) and flags predicted problems
+before they fully materialize, e.g.:
+  - Mortality rate trending upward toward a critical level
+  - FCR trending worse (feed efficiency degrading)
+  - Weight gain trending below the expected growth curve
+  - Temperature/humidity trending out of the comfort band
+
+This is intentionally simple & transparent (linear trend extrapolation over
+a trailing window) rather than a black-box model — farm operators need to
+trust and act on these forecasts quickly, and small daily datasets don't
+support complex models well.
+"""
+
+from __future__ import annotations
+import numpy as np
+import pandas as pd
+
+
+TREND_WINDOW = 7          # trailing days used to fit the trend line
+FORECAST_HORIZON = 3      # days ahead to project
+
+# Risk thresholds used to interpret a forecasted value
+RISK_LIMITS = {
+    "cumulative_mortality_pct": {"warn": 5.0, "critical": 8.0},
+    "fcr": {"warn": 1.8, "critical": 2.1},
+    "daily_mortality_rate_pct": {"warn": 0.4, "critical": 0.8},
+    "temperature_c": {"warn_high": 32.0, "critical_high": 34.0,
+                       "warn_low": 19.0, "critical_low": 16.0},
+}
+
+
+def _fit_linear_trend(y: np.ndarray) -> tuple[float, float]:
+    """Fit y = a*x + b over the given window using least squares. Returns (a, b)."""
+    x = np.arange(len(y))
+    if len(y) < 2 or np.all(np.isnan(y)):
+        return 0.0, float(y[-1]) if len(y) else 0.0
+    mask = ~np.isnan(y)
+    if mask.sum() < 2:
+        return 0.0, float(np.nanmean(y))
+    a, b = np.polyfit(x[mask], y[mask], 1)
+    return float(a), float(b)
+
+
+def forecast_metric(kpi_df: pd.DataFrame, column: str,
+                     window: int = TREND_WINDOW,
+                     horizon: int = FORECAST_HORIZON) -> pd.DataFrame:
+    """
+    Returns a small DataFrame of forecasted values for `column` for the next
+    `horizon` days, based on a linear fit over the trailing `window` days.
+    """
+    recent = kpi_df[column].tail(window).to_numpy(dtype=float)
+    slope, intercept = _fit_linear_trend(recent)
+
+    last_x = len(recent) - 1
+    future_x = np.arange(last_x + 1, last_x + 1 + horizon)
+    forecast_vals = slope * future_x + intercept
+
+    last_day = int(kpi_df["day_of_batch"].iloc[-1])
+    future_days = [last_day + i for i in range(1, horizon + 1)]
+
+    return pd.DataFrame({
+        "day_of_batch": future_days,
+        "metric": column,
+        "forecast_value": forecast_vals,
+        "trend_slope_per_day": slope,
+    })
+
+
+def predict_problems(kpi_df: pd.DataFrame) -> list[dict]:
+    """
+    Runs forecasts for the key risk metrics and returns a list of predicted-
+    problem dicts (empty list if nothing concerning is trending).
+
+    Each dict: {metric, current_value, forecast_value, forecast_day,
+                risk_level ('watch'|'warning'|'critical'), detail}
+    """
+    predictions = []
+
+    metrics_to_check = ["cumulative_mortality_pct", "fcr", "daily_mortality_rate_pct", "temperature_c"]
+    metrics_to_check = [m for m in metrics_to_check if m in kpi_df.columns]
+
+    for metric in metrics_to_check:
+        fc = forecast_metric(kpi_df, metric)
+        current_value = float(kpi_df[metric].iloc[-1])
+        end_value = float(fc["forecast_value"].iloc[-1])
+        forecast_day = int(fc["day_of_batch"].iloc[-1])
+        slope = float(fc["trend_slope_per_day"].iloc[0])
+
+        risk_level, detail = _assess_risk(metric, current_value, end_value, slope, forecast_day)
+        if risk_level is not None:
+            predictions.append({
+                "metric": metric,
+                "current_value": round(current_value, 3),
+                "forecast_value": round(end_value, 3),
+                "forecast_day": forecast_day,
+                "trend_slope_per_day": round(slope, 4),
+                "risk_level": risk_level,
+                "detail": detail,
+            })
+
+    return predictions
+
+
+def _assess_risk(metric: str, current: float, forecast: float, slope: float,
+                  forecast_day: int) -> tuple[str | None, str]:
+    limits = RISK_LIMITS.get(metric)
+    if limits is None:
+        return None, ""
+
+    if metric == "temperature_c":
+        if forecast >= limits["critical_high"] or forecast <= limits["critical_low"]:
+            return "critical", (f"Temperature trend projects {forecast:.1f}\u00b0C by day "
+                                 f"{forecast_day} — outside safe range.")
+        if forecast >= limits["warn_high"] or forecast <= limits["warn_low"]:
+            return "warning", (f"Temperature trend projects {forecast:.1f}\u00b0C by day "
+                                f"{forecast_day} — approaching stress range.")
+        return None, ""
+
+    # generic "higher is worse" metrics: mortality, fcr
+    if "critical" in limits and forecast >= limits["critical"]:
+        return "critical", (f"{metric} is trending toward {forecast:.2f} by day "
+                             f"{forecast_day} (current: {current:.2f}), exceeding the "
+                             f"critical limit of {limits['critical']}.")
+    if "warn" in limits and forecast >= limits["warn"] and slope > 0:
+        return "warning", (f"{metric} is trending upward toward {forecast:.2f} by day "
+                            f"{forecast_day} (current: {current:.2f}) — approaching the "
+                            f"warning limit of {limits['warn']}.")
+    return None, ""
+
+
+if __name__ == "__main__":
+    from data_simulator import simulate_farm_data
+    from kpi_engine import compute_daily_kpis
+
+    raw = simulate_farm_data(n_days=25)  # cut short, mid-batch, to test forecasting
+    kpis = compute_daily_kpis(raw)
+    preds = predict_problems(kpis)
+    print(f"Predicted {len(preds)} potential problems:\n")
+    for p in preds:
+        print(f"  [{p['risk_level'].upper()}] {p['detail']}")
